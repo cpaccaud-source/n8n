@@ -1,0 +1,147 @@
+{
+  "name": "BPC GetData",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "labelIds": [],
+          "sender": "newsletter@biopharmcatalyst.com"
+        },
+        "options": {}
+      },
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        -272,
+        0
+      ],
+      "id": "7f4f19b5-f5c2-4bc2-9473-c3fc49ad1165",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "kII1yfBo6POyhoBz",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Normalisation simple + mapping vers log_mail\n\nconst stripHtml = s =>\n  (s || '')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi,'')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi,'')\n    .replace(/<[^>]+>/g,' ')\n    .replace(/\\s+/g,' ')\n    .trim();\n\nfunction normAddr(v) {\n  if (!v) return '';\n  if (typeof v === 'string') return v;\n\n  if (Array.isArray(v)) return v.map(normAddr).filter(Boolean).join(', ');\n  if (Array.isArray(v.value)) return v.value.map(normAddr).filter(Boolean).join(', ');\n  if (v.address || v.name) return v.name ? `${v.name} <${v.address || ''}>` : (v.address || '');\n\n  try { return JSON.stringify(v); } catch { return String(v); }\n}\n\nconst id        = $json.id || $json.messageId || '';\nconst threadId  = $json.threadId || '';\nconst from      = $json.from || $json.headers?.from || '';\nconst to        = $json.to   || $json.headers?.to   || '';\nconst subject   = $json.subject || $json.headers?.subject || '';\nconst snippet   = $json.snippet || '';\nconst html      = $json.html || '';\nconst text      = $json.text || '';\n\nconst rawBody = text ? text : stripHtml(html);\n\nconst BODY_LIMIT = 8000;\nconst SNIPPET_LIMIT = 500;\nconst SUBJECT_LIMIT = 500;\nconst bodyTooLong = rawBody.length > BODY_LIMIT;\nconst snippetNorm = String(snippet || '');\nconst subjectNorm = String(subject || '');\n\nconst bodyText = bodyTooLong\n  ? `${rawBody.slice(0, BODY_LIMIT)}…`\n  : rawBody;\nconst snippetText = snippetNorm.length > SNIPPET_LIMIT\n  ? `${snippetNorm.slice(0, SNIPPET_LIMIT)}…`\n  : snippetNorm;\nconst subjectText = subjectNorm.length > SUBJECT_LIMIT\n  ? `${subjectNorm.slice(0, SUBJECT_LIMIT)}…`\n  : subjectNorm;\n\nconst dateHdr = $json.date || $json.headers?.date || $json.internalDate;\nlet received = new Date();\nif (dateHdr) {\n  const timestamp = Number(dateHdr);\n  const parsed = Number.isNaN(timestamp)\n    ? new Date(dateHdr)\n    : new Date(timestamp);\n  if (!Number.isNaN(parsed.valueOf())) received = parsed;\n}\n\nconst atts = $json.attachments || [];\n\nreturn {\n  json: {\n    gmail_id: id,\n    thread_id: threadId,\n    from_addr: normAddr(from),\n    to_addr: normAddr(to),\n    subject: subjectText,\n    snippet: snippetText,\n    body_text: String(bodyText || ''),\n    received_at: received.toISOString(),\n    attachments_count: Array.isArray(atts) ? atts.length : 0,\n    link: id ? `https://mail.google.com/mail/u/0/#all/${id}` : null,\n    body_truncated: bodyTooLong\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        16,
+        0
+      ],
+      "id": "8a104cc6-1c07-4a73-bcfe-f0662d1fd7dd",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "limit": 10,
+        "simple": false,
+        "filters": {
+          "sender": "newsletter@biopharmcatalyst.com"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -256,
+        -224
+      ],
+      "id": "ef853add-3805-4a92-bf98-8ccbe4dff4ab",
+      "name": "Get many messages",
+      "webhookId": "d26c75c1-4742-4cbd-8e57-9176db2d6395",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "kII1yfBo6POyhoBz",
+          "name": "Gmail account"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH p AS (\n  SELECT CASE\n           WHEN jsonb_typeof($1::jsonb) = 'array' THEN ($1::jsonb->0)\n           ELSE $1::jsonb\n         END AS j\n),\nins AS (\n  INSERT INTO public.log_mail\n    (gmail_id, thread_id, from_addr, to_addr, subject, snippet, body_text, received_at, attachments_count, link)\n  SELECT\n    p.j->>'gmail_id',\n    p.j->>'thread_id',\n    p.j->>'from_addr',\n    p.j->>'to_addr',\n    p.j->>'subject',\n    COALESCE(p.j->>'snippet',''),\n    p.j->>'body_text',\n    (p.j->>'received_at')::timestamptz,\n    COALESCE((p.j->>'attachments_count')::int, 0),\n    p.j->>'link'\n  FROM p\n  ON CONFLICT (gmail_id) DO UPDATE SET\n    thread_id = EXCLUDED.thread_id,\n    from_addr = EXCLUDED.from_addr,\n    to_addr = EXCLUDED.to_addr,\n    subject = EXCLUDED.subject,\n    snippet = EXCLUDED.snippet,\n    body_text = EXCLUDED.body_text,\n    received_at = EXCLUDED.received_at,\n    attachments_count = EXCLUDED.attachments_count,\n    link = EXCLUDED.link\n  RETURNING gmail_id\n)\nSELECT json_build_object('status','ok','gmail_id', gmail_id) AS result\nFROM ins;\n",
+        "options": {
+          "queryReplacement": "=={{$json}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        0
+      ],
+      "id": "02272c3e-b71a-41d0-8366-7f8c1048ea89",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "jiiNyFi5P57vh4iU",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many messages": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "bbe4aff7-5796-49b8-91d9-0f252a4518c7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "20bc9e06c419341aab31350f66e059a64c2c619f38fd53943ad1e01dd0b4f9cf"
+  },
+  "id": "rcaxZdjxyXqquJbz",
+  "tags": []
+}
